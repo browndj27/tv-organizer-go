@@ -8,21 +8,20 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// Configuration constants (mirrors App.config defaults)
 const (
-	parallelFileThreshold       = 100
-	parallelProcessingThreshold = 20
-	fileBufferSize              = 65536
-	logBufferSize               = 50
+	fileBufferSize = 4 * 1024 * 1024 // 4 MB — much better for large video files
+	logBufferSize  = 50
 )
 
-// Accepted video file extensions
+var copyWorkers = min(runtime.NumCPU(), 8)
+
 var acceptedFormats = map[string]bool{
 	".mkv": true, ".srt": true, ".avi": true, ".mov": true,
 	".wmv": true, ".mp4": true, ".m4p": true, ".m4v": true,
@@ -30,13 +29,11 @@ var acceptedFormats = map[string]bool{
 	".mpv": true, ".m2v": true,
 }
 
-// Compiled regex patterns
 var (
 	seasonRegex  = regexp.MustCompile(`(?i)(s\d+)`)
 	episodeRegex = regexp.MustCompile(`(?i)(e\d+)`)
 )
 
-// TVFileInfo holds parsed information about a TV show file
 type TVFileInfo struct {
 	FilePath     string
 	FileName     string
@@ -45,7 +42,6 @@ type TVFileInfo struct {
 	Episode      string
 }
 
-// Organizer holds all state for the run
 type Organizer struct {
 	downloadPath string
 	tvPath       string
@@ -53,24 +49,17 @@ type Organizer struct {
 	logPath      string
 	startTime    time.Time
 
-	// Progress counters (atomic for concurrent access)
-	totalFiles    int64
+	totalFiles     int64
 	processedFiles int64
-	copiedFiles   int64
-	skippedFiles  int64
-	errorFiles    int64
+	copiedFiles    int64
+	skippedFiles   int64
+	errorFiles     int64
 
-	// MD5 cache
-	md5Cache   map[string]string
-	md5CacheMu sync.Mutex
-
-	// Buffered logging
 	logBuffer []string
 	logMu     sync.Mutex
 	logWriter *bufio.Writer
 	logFile   *os.File
 
-	// Email message (kept for parity; could be extended later)
 	emailLines []string
 	emailMu    sync.Mutex
 }
@@ -80,7 +69,6 @@ func newOrganizer(downloadPath, tvPath string) *Organizer {
 		downloadPath: downloadPath,
 		tvPath:       tvPath,
 		mappingFile:  make(map[string]string),
-		md5Cache:     make(map[string]string),
 		startTime:    time.Now(),
 	}
 }
@@ -115,7 +103,6 @@ func (o *Organizer) writeLog(msg string) {
 	}
 }
 
-// flushLogBuffer must be called with o.logMu held.
 func (o *Organizer) flushLogBuffer() {
 	if o.logWriter == nil || len(o.logBuffer) == 0 {
 		return
@@ -205,10 +192,8 @@ func (o *Organizer) loadMappingFile(filePath string) {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if idx := strings.Index(line, "="); idx != -1 {
-			key := strings.ToLower(strings.TrimSpace(line[:idx]))
-			val := strings.TrimSpace(line[idx+1:])
-			o.mappingFile[key] = val
+		if k, v, ok := strings.Cut(line, "="); ok {
+			o.mappingFile[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
 		}
 	}
 	o.writeLog(fmt.Sprintf("Loaded %d mapping entries", len(o.mappingFile)))
@@ -218,12 +203,11 @@ func (o *Organizer) loadMappingFile(filePath string) {
 
 func (o *Organizer) getVideoFiles() []string {
 	var files []string
-	_ = filepath.Walk(o.downloadPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	_ = filepath.WalkDir(o.downloadPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if acceptedFormats[ext] {
+		if acceptedFormats[strings.ToLower(filepath.Ext(path))] {
 			files = append(files, path)
 		}
 		return nil
@@ -244,22 +228,20 @@ func (o *Organizer) parseTVShowInfo(filePath string) *TVFileInfo {
 		return nil
 	}
 
-	rawSeason := fileName[seasonMatch[0]:seasonMatch[1]]  // e.g. "s02"
-	rawEpisode := fileName[episodeMatch[0]:episodeMatch[1]] // e.g. "e05"
+	rawSeason := fileName[seasonMatch[0]:seasonMatch[1]]
+	rawEpisode := fileName[episodeMatch[0]:episodeMatch[1]]
 
-	// Show name = everything before the season token
 	showName := fileName[:seasonMatch[0]]
 	showName = strings.ReplaceAll(showName, ".", " ")
 	showName = strings.ReplaceAll(showName, "'", " ")
 	showName = strings.TrimSpace(strings.ToLower(showName))
 
-	// Apply mapping
 	if mapped, ok := o.mappingFile[showName]; ok {
 		showName = mapped
 	}
 
-	seasonFolder := "season " + strings.ToLower(rawSeason[1:]) // strip leading 's'
-	episode := strings.ToLower(rawEpisode[1:])                 // strip leading 'e'
+	seasonFolder := "season " + strings.ToLower(rawSeason[1:])
+	episode := strings.ToLower(rawEpisode[1:])
 
 	info := &TVFileInfo{
 		FilePath:     filePath,
@@ -280,32 +262,40 @@ func (o *Organizer) parseTVShowInfo(filePath string) *TVFileInfo {
 	return info
 }
 
-// ── MD5 ───────────────────────────────────────────────────────────────────────
+// ── Copy + hash ───────────────────────────────────────────────────────────────
 
-func (o *Organizer) getCachedMD5(filePath string) string {
-	o.md5CacheMu.Lock()
-	if cached, ok := o.md5Cache[filePath]; ok {
-		o.md5CacheMu.Unlock()
-		return cached
+// copyFileWithHash copies src to dst and returns the MD5 of the source data,
+// computed for free as part of the single read pass — no second read needed.
+func copyFileWithHash(src, dst string) (string, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return "", err
 	}
-	o.md5CacheMu.Unlock()
+	defer in.Close()
 
-	hash := calculateMD5(filePath)
+	out, err := os.Create(dst)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
 
-	o.md5CacheMu.Lock()
-	o.md5Cache[filePath] = hash
-	o.md5CacheMu.Unlock()
-
-	return hash
+	h := md5.New()
+	buf := make([]byte, fileBufferSize)
+	if _, err = io.CopyBuffer(io.MultiWriter(out, h), in, buf); err != nil {
+		return "", err
+	}
+	if err = out.Sync(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%X", h.Sum(nil)), nil
 }
 
-func calculateMD5(filePath string) string {
+func hashFile(filePath string) string {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "ERROR"
 	}
 	defer f.Close()
-
 	h := md5.New()
 	buf := make([]byte, fileBufferSize)
 	if _, err := io.CopyBuffer(h, f, buf); err != nil {
@@ -314,60 +304,12 @@ func calculateMD5(filePath string) string {
 	return fmt.Sprintf("%X", h.Sum(nil))
 }
 
-func (o *Organizer) verifyFileCopy(src, dst string) bool {
-	srcInfo, err := os.Stat(src)
-	if err != nil {
-		o.writeLog(fmt.Sprintf("Error stating source file: %v", err))
-		return false
-	}
-	dstInfo, err := os.Stat(dst)
-	if err != nil {
-		o.writeLog(fmt.Sprintf("Error stating dest file: %v", err))
-		return false
-	}
-	if srcInfo.Size() != dstInfo.Size() {
-		o.writeLog(fmt.Sprintf("Size mismatch: Source=%d, Dest=%d", srcInfo.Size(), dstInfo.Size()))
-		return false
-	}
-	srcMD5 := o.getCachedMD5(src)
-	dstMD5 := o.getCachedMD5(dst)
-	if srcMD5 == dstMD5 {
-		o.writeLog(fmt.Sprintf("MD5 verified: %s", srcMD5))
-		return true
-	}
-	o.writeLog(fmt.Sprintf("MD5 mismatch: Source=%s, Dest=%s", srcMD5, dstMD5))
-	return false
-}
-
-// ── Copy ──────────────────────────────────────────────────────────────────────
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	buf := make([]byte, fileBufferSize)
-	if _, err = io.CopyBuffer(out, in, buf); err != nil {
-		return err
-	}
-	return out.Sync()
-}
-
 func (o *Organizer) copyTVFile(info *TVFileInfo, deleteFiles bool) {
 	destPath := filepath.Join(o.tvPath, info.ShowName, info.SeasonFolder, info.FileName)
 
 	atomic.AddInt64(&o.processedFiles, 1)
 	o.showProgress("Processing")
 
-	// Skip if destination exists with same size
 	if dstInfo, err := os.Stat(destPath); err == nil {
 		if srcInfo, err := os.Stat(info.FilePath); err == nil && srcInfo.Size() == dstInfo.Size() {
 			atomic.AddInt64(&o.skippedFiles, 1)
@@ -380,91 +322,97 @@ func (o *Organizer) copyTVFile(info *TVFileInfo, deleteFiles bool) {
 		}
 	}
 
-	if err := copyFile(info.FilePath, destPath); err != nil {
+	srcHash, err := copyFileWithHash(info.FilePath, destPath)
+	if err != nil {
 		atomic.AddInt64(&o.errorFiles, 1)
 		o.writeLog(fmt.Sprintf("ERROR copying file %s: %v", info.FileName, err))
 		return
 	}
 	o.writeLog(fmt.Sprintf("Copied: %s -> %s", info.FilePath, destPath))
 
-	if o.verifyFileCopy(info.FilePath, destPath) {
+	dstHash := hashFile(destPath)
+	if srcHash == dstHash {
+		o.writeLog(fmt.Sprintf("MD5 verified: %s", srcHash))
 		atomic.AddInt64(&o.copiedFiles, 1)
-		o.writeLog(fmt.Sprintf("File integrity verified for %s", info.FileName))
 		if deleteFiles {
 			_ = os.Remove(info.FilePath)
 			o.writeLog(fmt.Sprintf("Deleted source file: %s", info.FilePath))
 		}
 	} else {
 		atomic.AddInt64(&o.errorFiles, 1)
-		o.writeLog(fmt.Sprintf("ERROR: File copy verification failed for %s", info.FileName))
+		o.writeLog(fmt.Sprintf("ERROR: MD5 mismatch for %s — src=%s dst=%s", info.FileName, srcHash, dstHash))
 	}
 }
 
 // ── Processing ────────────────────────────────────────────────────────────────
 
 func (o *Organizer) processFiles(videoFiles []string, deleteFiles bool) {
-	// Parse all files (parallel if above threshold)
+	// Parse all files in parallel
 	parsedFiles := make([]*TVFileInfo, 0, len(videoFiles))
-
-	if len(videoFiles) > parallelProcessingThreshold {
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		for _, f := range videoFiles {
-			wg.Add(1)
-			go func(path string) {
-				defer wg.Done()
-				if info := o.parseTVShowInfo(path); info != nil {
-					mu.Lock()
-					parsedFiles = append(parsedFiles, info)
-					mu.Unlock()
-				}
-			}(f)
-		}
-		wg.Wait()
-	} else {
-		for _, f := range videoFiles {
-			if info := o.parseTVShowInfo(f); info != nil {
+	var parseMu sync.Mutex
+	var parseWg sync.WaitGroup
+	for _, f := range videoFiles {
+		parseWg.Add(1)
+		go func(path string) {
+			defer parseWg.Done()
+			if info := o.parseTVShowInfo(path); info != nil {
+				parseMu.Lock()
 				parsedFiles = append(parsedFiles, info)
+				parseMu.Unlock()
+			}
+		}(f)
+	}
+	parseWg.Wait()
+
+	o.writeLog(fmt.Sprintf("Successfully parsed %d TV show files", len(parsedFiles)))
+
+	// Create all destination directories upfront (fast, serial is fine)
+	type groupKey struct{ show, season string }
+	seen := make(map[groupKey]bool, len(parsedFiles))
+	for _, info := range parsedFiles {
+		k := groupKey{info.ShowName, info.SeasonFolder}
+		if !seen[k] {
+			seen[k] = true
+			showSeasonPath := filepath.Join(o.tvPath, k.show, k.season)
+			if err := os.MkdirAll(showSeasonPath, 0755); err != nil {
+				o.writeLog(fmt.Sprintf("ERROR creating directory %s: %v", showSeasonPath, err))
 			}
 		}
 	}
 
-	o.writeLog(fmt.Sprintf("Successfully parsed %d TV show files", len(parsedFiles)))
-
-	// Group by show/season and create directories
-	type groupKey struct{ show, season string }
-	groups := make(map[groupKey][]*TVFileInfo)
+	// Copy files with a worker pool — I/O bound, so N workers in parallel
+	work := make(chan *TVFileInfo, len(parsedFiles))
 	for _, info := range parsedFiles {
-		k := groupKey{info.ShowName, info.SeasonFolder}
-		groups[k] = append(groups[k], info)
+		work <- info
 	}
+	close(work)
 
-	for k, infos := range groups {
-		showSeasonPath := filepath.Join(o.tvPath, k.show, k.season)
-		if err := os.MkdirAll(showSeasonPath, 0755); err != nil {
-			o.writeLog(fmt.Sprintf("ERROR creating directory %s: %v", showSeasonPath, err))
-			continue
-		}
-		for _, info := range infos {
-			o.copyTVFile(info, deleteFiles)
-		}
+	workers := min(copyWorkers, len(parsedFiles))
+	var copyWg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		copyWg.Add(1)
+		go func() {
+			defer copyWg.Done()
+			for info := range work {
+				o.copyTVFile(info, deleteFiles)
+			}
+		}()
 	}
+	copyWg.Wait()
 }
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────
 
-// cleanUpSource deletes non-video files under a directory tree.
 func (o *Organizer) cleanUpSource(dir string) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		o.writeLog(fmt.Sprintf("Directory does not exist: %s", dir))
 		return
 	}
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if !acceptedFormats[ext] {
+		if !acceptedFormats[strings.ToLower(filepath.Ext(path))] {
 			if removeErr := os.Remove(path); removeErr == nil {
 				o.writeLog(fmt.Sprintf("Clean up deleted file: %s", path))
 			}
@@ -473,18 +421,14 @@ func (o *Organizer) cleanUpSource(dir string) {
 	})
 }
 
-// deleteEmptyFolders removes all empty directories under root (bottom-up).
 func (o *Organizer) deleteEmptyFolders(root string) {
-	// Collect all subdirectory paths
 	var dirs []string
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info.IsDir() && path != root {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && path != root {
 			dirs = append(dirs, path)
 		}
 		return nil
 	})
-
-	// Walk in reverse order so deepest dirs are handled first
 	for i := len(dirs) - 1; i >= 0; i-- {
 		entries, err := os.ReadDir(dirs[i])
 		if err == nil && len(entries) == 0 {
@@ -547,7 +491,6 @@ func main() {
 
 	o := newOrganizer(downloadPath, tvPath)
 
-	// Ensure destination and logs directories exist
 	if err := os.MkdirAll(filepath.Join(tvPath, "logs"), 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not create TV path: %v\n", err)
 	}
@@ -555,7 +498,6 @@ func main() {
 	o.createLog(filepath.Join(tvPath, "logs"))
 	defer o.closeLog()
 
-	// Print startup banner
 	fmt.Println()
 	fmt.Println("═══════════════════════════════════════════════════════════")
 	fmt.Println("          TV FOLDER ORGANIZER - Starting Process")
@@ -567,6 +509,7 @@ func main() {
 		deleteStr = "YES"
 	}
 	fmt.Printf("Delete Originals: %s\n", deleteStr)
+	fmt.Printf("Copy Workers:     %d\n", copyWorkers)
 	fmt.Printf("Started:          %s\n", o.startTime.Format("2006-01-02 15:04:05"))
 	fmt.Println("═══════════════════════════════════════════════════════════")
 	fmt.Println()
@@ -577,7 +520,6 @@ func main() {
 	o.writeLog("TV PATH: " + tvPath)
 	o.writeLog(fmt.Sprintf("Delete Files: %v", deleteFiles))
 
-	// Load optional mapping file
 	if len(args) >= 4 {
 		if _, err := os.Stat(args[3]); err == nil {
 			fmt.Printf("Loading mapping file: %s\n", args[3])
@@ -586,7 +528,6 @@ func main() {
 		}
 	}
 
-	// Scan for video files
 	fmt.Println("Scanning for video files...")
 	videoFiles := o.getVideoFiles()
 	filesDetected := len(videoFiles)
@@ -611,7 +552,6 @@ func main() {
 		o.showFinalStats()
 	} else {
 		fmt.Println("No video files found to process.")
-		// Delete empty log file
 		o.closeLog()
 		_ = os.Remove(o.logPath)
 	}
