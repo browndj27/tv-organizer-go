@@ -235,6 +235,8 @@ func (o *Organizer) parseTVShowInfo(filePath string) *TVFileInfo {
 	showName = strings.ReplaceAll(showName, ".", " ")
 	showName = strings.ReplaceAll(showName, "'", " ")
 	showName = strings.TrimSpace(strings.ToLower(showName))
+	showName = strings.TrimRight(showName, "- ")
+	showName = strings.TrimSpace(showName)
 
 	if mapped, ok := o.mappingFile[showName]; ok {
 		showName = mapped
