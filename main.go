@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
@@ -34,9 +35,8 @@ var acceptedFormats = map[string]bool{
 }
 
 var (
-	seasonRegex      = regexp.MustCompile(`(?i)(s\d+)`)
-	episodeRegex     = regexp.MustCompile(`(?i)(e\d+)`)
-	trailingSepRegex = regexp.MustCompile(`[\s\-_\.]+$`)
+	seasonRegex  = regexp.MustCompile(`(?i)(s\d+)`)
+	episodeRegex = regexp.MustCompile(`(?i)(e\d+)`)
 )
 
 type TVFileInfo struct {
@@ -237,7 +237,9 @@ func (o *Organizer) parseTVShowInfo(filePath string) *TVFileInfo {
 	showName = strings.ReplaceAll(showName, ".", " ")
 	showName = strings.ReplaceAll(showName, "'", " ")
 	showName = strings.TrimSpace(strings.ToLower(showName))
-	showName = trailingSepRegex.ReplaceAllString(showName, "")
+	showName = strings.TrimRightFunc(showName, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 
 	if mapped, ok := o.mappingFile[showName]; ok {
 		showName = mapped
