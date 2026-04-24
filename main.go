@@ -22,6 +22,10 @@ const (
 
 var copyWorkers = min(runtime.NumCPU(), 8)
 
+var copyBufPool = sync.Pool{
+	New: func() any { return make([]byte, fileBufferSize) },
+}
+
 var acceptedFormats = map[string]bool{
 	".mkv": true, ".srt": true, ".avi": true, ".mov": true,
 	".wmv": true, ".mp4": true, ".m4p": true, ".m4v": true,
@@ -30,8 +34,9 @@ var acceptedFormats = map[string]bool{
 }
 
 var (
-	seasonRegex  = regexp.MustCompile(`(?i)(s\d+)`)
-	episodeRegex = regexp.MustCompile(`(?i)(e\d+)`)
+	seasonRegex      = regexp.MustCompile(`(?i)(s\d+)`)
+	episodeRegex     = regexp.MustCompile(`(?i)(e\d+)`)
+	trailingSepRegex = regexp.MustCompile(`[\s\-_\.]+$`)
 )
 
 type TVFileInfo struct {
@@ -59,9 +64,6 @@ type Organizer struct {
 	logMu     sync.Mutex
 	logWriter *bufio.Writer
 	logFile   *os.File
-
-	emailLines []string
-	emailMu    sync.Mutex
 }
 
 func newOrganizer(downloadPath, tvPath string) *Organizer {
@@ -235,8 +237,7 @@ func (o *Organizer) parseTVShowInfo(filePath string) *TVFileInfo {
 	showName = strings.ReplaceAll(showName, ".", " ")
 	showName = strings.ReplaceAll(showName, "'", " ")
 	showName = strings.TrimSpace(strings.ToLower(showName))
-	showName = strings.TrimRight(showName, "- ")
-	showName = strings.TrimSpace(showName)
+	showName = trailingSepRegex.ReplaceAllString(showName, "")
 
 	if mapped, ok := o.mappingFile[showName]; ok {
 		showName = mapped
@@ -255,11 +256,6 @@ func (o *Organizer) parseTVShowInfo(filePath string) *TVFileInfo {
 
 	o.writeLog(fmt.Sprintf("Parsed: %s -> Show: %s, Season: %s, Episode: %s",
 		fileName, showName, seasonFolder, episode))
-
-	o.emailMu.Lock()
-	o.emailLines = append(o.emailLines,
-		fmt.Sprintf("SHOW: %s SEASON: %s EPISODE: %s", showName, seasonFolder, episode))
-	o.emailMu.Unlock()
 
 	return info
 }
@@ -282,7 +278,8 @@ func copyFileWithHash(src, dst string) (string, error) {
 	defer out.Close()
 
 	h := md5.New()
-	buf := make([]byte, fileBufferSize)
+	buf := copyBufPool.Get().([]byte)
+	defer copyBufPool.Put(buf)
 	if _, err = io.CopyBuffer(io.MultiWriter(out, h), in, buf); err != nil {
 		return "", err
 	}
@@ -292,25 +289,11 @@ func copyFileWithHash(src, dst string) (string, error) {
 	return fmt.Sprintf("%X", h.Sum(nil)), nil
 }
 
-func hashFile(filePath string) string {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "ERROR"
-	}
-	defer f.Close()
-	h := md5.New()
-	buf := make([]byte, fileBufferSize)
-	if _, err := io.CopyBuffer(h, f, buf); err != nil {
-		return "ERROR"
-	}
-	return fmt.Sprintf("%X", h.Sum(nil))
-}
 
 func (o *Organizer) copyTVFile(info *TVFileInfo, deleteFiles bool) {
 	destPath := filepath.Join(o.tvPath, info.ShowName, info.SeasonFolder, info.FileName)
 
 	atomic.AddInt64(&o.processedFiles, 1)
-	o.showProgress("Processing")
 
 	if dstInfo, err := os.Stat(destPath); err == nil {
 		if srcInfo, err := os.Stat(info.FilePath); err == nil && srcInfo.Size() == dstInfo.Size() {
@@ -324,45 +307,44 @@ func (o *Organizer) copyTVFile(info *TVFileInfo, deleteFiles bool) {
 		}
 	}
 
-	srcHash, err := copyFileWithHash(info.FilePath, destPath)
+	dataHash, err := copyFileWithHash(info.FilePath, destPath)
 	if err != nil {
 		atomic.AddInt64(&o.errorFiles, 1)
 		o.writeLog(fmt.Sprintf("ERROR copying file %s: %v", info.FileName, err))
 		return
 	}
-	o.writeLog(fmt.Sprintf("Copied: %s -> %s", info.FilePath, destPath))
-
-	dstHash := hashFile(destPath)
-	if srcHash == dstHash {
-		o.writeLog(fmt.Sprintf("MD5 verified: %s", srcHash))
-		atomic.AddInt64(&o.copiedFiles, 1)
-		if deleteFiles {
-			_ = os.Remove(info.FilePath)
-			o.writeLog(fmt.Sprintf("Deleted source file: %s", info.FilePath))
-		}
-	} else {
-		atomic.AddInt64(&o.errorFiles, 1)
-		o.writeLog(fmt.Sprintf("ERROR: MD5 mismatch for %s — src=%s dst=%s", info.FileName, srcHash, dstHash))
+	o.writeLog(fmt.Sprintf("Copied: %s -> %s (MD5: %s)", info.FilePath, destPath, dataHash))
+	atomic.AddInt64(&o.copiedFiles, 1)
+	if deleteFiles {
+		_ = os.Remove(info.FilePath)
+		o.writeLog(fmt.Sprintf("Deleted source file: %s", info.FilePath))
 	}
 }
 
 // ── Processing ────────────────────────────────────────────────────────────────
 
 func (o *Organizer) processFiles(videoFiles []string, deleteFiles bool) {
-	// Parse all files in parallel
+	// Parse files with a bounded worker pool — avoids spawning thousands of goroutines
 	parsedFiles := make([]*TVFileInfo, 0, len(videoFiles))
 	var parseMu sync.Mutex
 	var parseWg sync.WaitGroup
+	parseWork := make(chan string, len(videoFiles))
 	for _, f := range videoFiles {
+		parseWork <- f
+	}
+	close(parseWork)
+	for i := 0; i < min(runtime.NumCPU(), len(videoFiles)); i++ {
 		parseWg.Add(1)
-		go func(path string) {
+		go func() {
 			defer parseWg.Done()
-			if info := o.parseTVShowInfo(path); info != nil {
-				parseMu.Lock()
-				parsedFiles = append(parsedFiles, info)
-				parseMu.Unlock()
+			for path := range parseWork {
+				if info := o.parseTVShowInfo(path); info != nil {
+					parseMu.Lock()
+					parsedFiles = append(parsedFiles, info)
+					parseMu.Unlock()
+				}
 			}
-		}(f)
+		}()
 	}
 	parseWg.Wait()
 
@@ -389,6 +371,21 @@ func (o *Organizer) processFiles(videoFiles []string, deleteFiles bool) {
 	}
 	close(work)
 
+	// Single goroutine updates progress every 200ms — avoids racing fmt.Printf from workers
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				o.showProgress("Processing")
+			case <-stop:
+				return
+			}
+		}
+	}()
+
 	workers := min(copyWorkers, len(parsedFiles))
 	var copyWg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -401,6 +398,8 @@ func (o *Organizer) processFiles(videoFiles []string, deleteFiles bool) {
 		}()
 	}
 	copyWg.Wait()
+	close(stop)
+	o.showProgress("Complete")
 }
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────
