@@ -1,2 +1,2 @@
 @echo off
-tvorganizer.exe "J:\TV Temp" "J:\TV Shows" true
+"%~dp0..\tvorganizer.exe" "J:\TV Temp" "J:\TV Shows" true
