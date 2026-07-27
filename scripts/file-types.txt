@@ -1,0 +1,10 @@
+# List file extensions to delete, one per line.
+# Leading dot is optional (both "nfo" and ".nfo" work).
+# Lines starting with # or ; are ignored.
+.nfo
+.txt
+.jpg
+.jpeg
+.png
+.srt
+.sample
