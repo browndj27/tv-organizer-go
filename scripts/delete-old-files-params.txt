@@ -1,0 +1,5 @@
+# Line 1: directory to clean
+# Line 2: delete files older than this many days
+# Lines starting with # or ; are ignored
+C:\Users\Administrator\Downloads\Completed Torrents
+30
